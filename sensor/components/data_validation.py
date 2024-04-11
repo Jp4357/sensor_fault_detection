@@ -7,6 +7,7 @@ import pandas as pd
 from typing import Optional
 from sensor import utils
 import numpy as np
+from sensor.config import TARGET_COLUMN
 
 class DataValidation:
     
@@ -29,7 +30,7 @@ class DataValidation:
             drop_column_names = null_report[null_report>threshold].index
             
             logging.info(f"Columns to drop:  {list(drop_column_names)}")
-            self.validation_error[report_key_name]=list(drop_column_names)
+            self.validation_error[report_key_name]=list(drop_column_names) 
             
             df.drop(list(drop_column_names),axis=1,inplace=True)
             if len(df.columns)==0:
@@ -99,7 +100,7 @@ class DataValidation:
             logging.info(f"drop null values columns from test df") 
             test_df = self.drop_missing_values_columns(df=test_df,report_key_name="missing_values_within_test_dataset")
             
-            exclude_columns = ["class"]
+            exclude_columns = [TARGET_COLUMN]
             base_df = utils.convert_column_float(df=base_df,exclude_columns=exclude_columns)
             train_df = utils.convert_column_float(df=train_df,exclude_columns=exclude_columns)
             test_df = utils.convert_column_float(df=test_df,exclude_columns=exclude_columns)
