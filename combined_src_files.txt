@@ -1,0 +1,910 @@
+-- sensor\components\data_ingestion.py --
+from sensor import utils
+from sensor.entity import config_entity
+from sensor.entity import artifact_entity
+from sensor.exception import SensorException
+from sensor.logger import logging
+import os, sys
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+
+class DataIngestion:
+
+    def __init__(self, data_ingestion_config: config_entity.DataIngestionConfig):
+        try:
+            logging.info(f"{'>>'*20} Data Ingestion {'<<'*20}")
+            self.data_ingestion_config = data_ingestion_config
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def initiate_data_ingestion(self) -> artifact_entity.DataIngestionArtifact:
+        try:
+            logging.info(f"Exporting collection data as pandas dataframe")
+            # Exporting collection data as pandas dataframe
+            df: pd.DataFrame = utils.get_collection_as_dataframe(
+                database_name=self.data_ingestion_config.database_name,
+                collection_name=self.data_ingestion_config.collection_name,
+            )
+
+            logging.info("Save data in feature store")
+
+            # replace na with Nan
+            df.replace(to_replace="na", value=np.NAN, inplace=True)
+
+            # Save data in feature store
+            logging.info("Create feature store folder if not available")
+            # Create feature store folder if not available
+            feature_store_dir = os.path.dirname(
+                self.data_ingestion_config.feature_store_file_path
+            )
+            os.makedirs(feature_store_dir, exist_ok=True)
+            logging.info("Save df to feature store folder")
+            # Save df to feature store folder
+            df.to_csv(
+                path_or_buf=self.data_ingestion_config.feature_store_file_path,
+                index=False,
+                header=True,
+            )
+
+            logging.info("split dataset into train and test set")
+            # split dataset into train and test set
+            train_df, test_df = train_test_split(
+                df, test_size=self.data_ingestion_config.test_size, random_state=42
+            )
+
+            logging.info("create dataset directory folder if not available")
+            # create dataset directory folder if not available
+            dataset_dir = os.path.dirname(self.data_ingestion_config.train_file_path)
+            os.makedirs(dataset_dir, exist_ok=True)
+
+            logging.info("Save df to feature store folder")
+            # Save df to feature store folder
+            train_df.to_csv(
+                path_or_buf=self.data_ingestion_config.train_file_path,
+                index=False,
+                header=True,
+            )
+            test_df.to_csv(
+                path_or_buf=self.data_ingestion_config.test_file_path,
+                index=False,
+                header=True,
+            )
+
+            # Prepare artifact
+
+            data_ingestion_artifact = artifact_entity.DataIngestionArtifact(
+                feature_store_file_path=self.data_ingestion_config.feature_store_file_path,
+                train_file_path=self.data_ingestion_config.train_file_path,
+                test_file_path=self.data_ingestion_config.test_file_path,
+            )
+
+            logging.info(f"Data ingestion artifact: {data_ingestion_artifact}")
+            return data_ingestion_artifact
+
+        except Exception as e:
+            raise SensorException(error_message=e, error_detail=sys)
+
+
+-- sensor\components\data_transformation.py --
+from sensor.entity import artifact_entity, config_entity
+from sensor.exception import SensorException
+from sensor.logger import logging
+from typing import Optional
+import os, sys
+from sklearn.pipeline import Pipeline
+import pandas as pd
+from sensor import utils
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from imblearn.combine import SMOTETomek
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import RobustScaler
+from sensor.config import TARGET_COLUMN
+
+
+class DataTransformation:
+
+    def __init__(
+        self,
+        data_transformation_config: config_entity.DataTransformationConfig,
+        data_ingestion_artifact: artifact_entity.DataIngestionArtifact,
+    ):
+        try:
+            logging.info(f"{'>>'*20} Data Transformation {'<<'*20}")
+            self.data_transformation_config = data_transformation_config
+            self.data_ingestion_artifact = data_ingestion_artifact
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    @classmethod
+    def get_data_transformer_object(cls) -> Pipeline:
+        try:
+            simple_imputer = SimpleImputer(strategy="constant", fill_value=0)
+            robust_scaler = RobustScaler()
+            pipeline = Pipeline(
+                steps=[("Imputer", simple_imputer), ("RobustScaler", robust_scaler)]
+            )
+            return pipeline
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def initiate_data_transformation(
+        self,
+    ) -> artifact_entity.DataTransformationArtifact:
+        try:
+            # reading training and testing file
+            train_df = pd.read_csv(self.data_ingestion_artifact.train_file_path)
+            test_df = pd.read_csv(self.data_ingestion_artifact.test_file_path)
+
+            # selecting input feature for train and test dataframe
+            input_feature_train_df = train_df.drop(TARGET_COLUMN, axis=1)
+            input_feature_test_df = test_df.drop(TARGET_COLUMN, axis=1)
+
+            # selecting target feature for train and test dataframe
+            target_feature_train_df = train_df[TARGET_COLUMN]
+            target_feature_test_df = test_df[TARGET_COLUMN]
+
+            label_encoder = LabelEncoder()
+            label_encoder.fit(target_feature_train_df)
+
+            # transformation on target columns
+            target_feature_train_arr = label_encoder.transform(target_feature_train_df)
+            target_feature_test_arr = label_encoder.transform(target_feature_test_df)
+
+            transformation_pipleine = DataTransformation.get_data_transformer_object()
+            transformation_pipleine.fit(input_feature_train_df)
+
+            # transforming input features
+            input_feature_train_arr = transformation_pipleine.transform(
+                input_feature_train_df
+            )
+            input_feature_test_arr = transformation_pipleine.transform(
+                input_feature_test_df
+            )
+
+            smt = SMOTETomek(random_state=42)
+            logging.info(
+                f"Before resampling in training set Input: {input_feature_train_arr.shape} Target:{target_feature_train_arr.shape}"
+            )
+            input_feature_train_arr, target_feature_train_arr = smt.fit_resample(
+                input_feature_train_arr, target_feature_train_arr
+            )
+            logging.info(
+                f"After resampling in training set Input: {input_feature_train_arr.shape} Target:{target_feature_train_arr.shape}"
+            )
+
+            logging.info(
+                f"Before resampling in testing set Input: {input_feature_test_arr.shape} Target:{target_feature_test_arr.shape}"
+            )
+            input_feature_test_arr, target_feature_test_arr = smt.fit_resample(
+                input_feature_test_arr, target_feature_test_arr
+            )
+            logging.info(
+                f"After resampling in testing set Input: {input_feature_test_arr.shape} Target:{target_feature_test_arr.shape}"
+            )
+
+            # target encoder
+            train_arr = np.c_[input_feature_train_arr, target_feature_train_arr]
+            test_arr = np.c_[input_feature_test_arr, target_feature_test_arr]
+
+            # save numpy array
+            utils.save_numpy_array_data(
+                file_path=self.data_transformation_config.transformed_train_path,
+                array=train_arr,
+            )
+
+            utils.save_numpy_array_data(
+                file_path=self.data_transformation_config.transformed_test_path,
+                array=test_arr,
+            )
+
+            utils.save_object(
+                file_path=self.data_transformation_config.transform_object_path,
+                obj=transformation_pipleine,
+            )
+
+            utils.save_object(
+                file_path=self.data_transformation_config.target_encoder_path,
+                obj=label_encoder,
+            )
+
+            data_transformation_artifact = artifact_entity.DataTransformationArtifact(
+                transform_object_path=self.data_transformation_config.transform_object_path,
+                transformed_train_path=self.data_transformation_config.transformed_train_path,
+                transformed_test_path=self.data_transformation_config.transformed_test_path,
+                target_encoder_path=self.data_transformation_config.target_encoder_path,
+            )
+
+            logging.info(f"Data transformation object {data_transformation_artifact}")
+            return data_transformation_artifact
+        except Exception as e:
+            raise SensorException(e, sys)
+
+
+-- sensor\components\data_validation.py --
+from sensor.entity import artifact_entity, config_entity
+from sensor.exception import SensorException
+from sensor.logger import logging
+from scipy.stats import ks_2samp
+from typing import Optional
+import os, sys
+import pandas as pd
+from sensor import utils
+import numpy as np
+from sensor.config import TARGET_COLUMN
+
+
+class DataValidation:
+
+    def __init__(
+        self,
+        data_validation_config: config_entity.DataValidationConfig,
+        data_ingestion_artifact: artifact_entity.DataIngestionArtifact,
+    ):
+        try:
+            logging.info(f"{'>>'*20} Data Validation {'<<'*20}")
+            self.data_validation_config = data_validation_config
+            self.data_ingestion_artifact = data_ingestion_artifact
+            self.validation_error = dict()
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def drop_missing_values_columns(
+        self, df: pd.DataFrame, report_key_name: str
+    ) -> Optional[pd.DataFrame]:
+        """
+        This function will drop column which contains missing value more than specified threshold
+
+        df: Accepts a pandas dataframe
+        threshold: Percentage criteria to drop a column
+        =====================================================================================
+        returns Pandas DataFrame if atleast a single column is available after missing columns drop else None
+        """
+        try:
+
+            threshold = self.data_validation_config.missing_threshold
+            null_report = df.isna().sum() / df.shape[0]
+            # selecting column name which contains null
+            logging.info(
+                f"selecting column name which contains null above to {threshold}"
+            )
+            drop_column_names = null_report[null_report > threshold].index
+
+            logging.info(f"Columns to drop: {list(drop_column_names)}")
+            self.validation_error[report_key_name] = list(drop_column_names)
+            df.drop(list(drop_column_names), axis=1, inplace=True)
+
+            # return None no columns left
+            if len(df.columns) == 0:
+                return None
+            return df
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def is_required_columns_exists(
+        self, base_df: pd.DataFrame, current_df: pd.DataFrame, report_key_name: str
+    ) -> bool:
+        try:
+
+            base_columns = base_df.columns
+            current_columns = current_df.columns
+
+            missing_columns = []
+            for base_column in base_columns:
+                if base_column not in current_columns:
+                    logging.info(f"Column: [{base} is not available.]")
+                    missing_columns.append(base_column)
+
+            if len(missing_columns) > 0:
+                self.validation_error[report_key_name] = missing_columns
+                return False
+            return True
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def data_drift(
+        self, base_df: pd.DataFrame, current_df: pd.DataFrame, report_key_name: str
+    ):
+        try:
+            drift_report = dict()
+
+            base_columns = base_df.columns
+            current_columns = current_df.columns
+
+            for base_column in base_columns:
+                base_data, current_data = base_df[base_column], current_df[base_column]
+                # Null hypothesis is that both column data drawn from same distrubtion
+
+                logging.info(
+                    f"Hypothesis {base_column}: {base_data.dtype}, {current_data.dtype} "
+                )
+                same_distribution = ks_2samp(base_data, current_data)
+
+                if same_distribution.pvalue > 0.05:
+                    # We are accepting null hypothesis
+                    drift_report[base_column] = {
+                        "pvalues": float(same_distribution.pvalue),
+                        "same_distribution": True,
+                    }
+                else:
+                    drift_report[base_column] = {
+                        "pvalues": float(same_distribution.pvalue),
+                        "same_distribution": False,
+                    }
+                    # different distribution
+
+            self.validation_error[report_key_name] = drift_report
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def initiate_data_validation(self) -> artifact_entity.DataValidationArtifact:
+        try:
+            logging.info(f"Reading base dataframe")
+            base_df = pd.read_csv(self.data_validation_config.base_file_path)
+            base_df.replace({"na": np.NAN}, inplace=True)
+            logging.info(f"Replace na value in base df")
+            # base_df has na as null
+            logging.info(f"Drop null values colums from base df")
+            base_df = self.drop_missing_values_columns(
+                df=base_df, report_key_name="missing_values_within_base_dataset"
+            )
+
+            logging.info(f"Reading train dataframe")
+            train_df = pd.read_csv(self.data_ingestion_artifact.train_file_path)
+            logging.info(f"Reading test dataframe")
+            test_df = pd.read_csv(self.data_ingestion_artifact.test_file_path)
+
+            logging.info(f"Drop null values colums from train df")
+            train_df = self.drop_missing_values_columns(
+                df=train_df, report_key_name="missing_values_within_train_dataset"
+            )
+            logging.info(f"Drop null values colums from test df")
+            test_df = self.drop_missing_values_columns(
+                df=test_df, report_key_name="missing_values_within_test_dataset"
+            )
+
+            exclude_columns = [TARGET_COLUMN]
+            base_df = utils.convert_columns_float(
+                df=base_df, exclude_columns=exclude_columns
+            )
+            train_df = utils.convert_columns_float(
+                df=train_df, exclude_columns=exclude_columns
+            )
+            test_df = utils.convert_columns_float(
+                df=test_df, exclude_columns=exclude_columns
+            )
+
+            logging.info(f"Is all required columns present in train df")
+            train_df_columns_status = self.is_required_columns_exists(
+                base_df=base_df,
+                current_df=train_df,
+                report_key_name="missing_columns_within_train_dataset",
+            )
+            logging.info(f"Is all required columns present in test df")
+            test_df_columns_status = self.is_required_columns_exists(
+                base_df=base_df,
+                current_df=test_df,
+                report_key_name="missing_columns_within_test_dataset",
+            )
+
+            if train_df_columns_status:
+                logging.info(
+                    f"As all column are available in train df hence detecting data drift"
+                )
+                self.data_drift(
+                    base_df=base_df,
+                    current_df=train_df,
+                    report_key_name="data_drift_within_train_dataset",
+                )
+            if test_df_columns_status:
+                logging.info(
+                    f"As all column are available in test df hence detecting data drift"
+                )
+                self.data_drift(
+                    base_df=base_df,
+                    current_df=test_df,
+                    report_key_name="data_drift_within_test_dataset",
+                )
+
+            # write the report
+            logging.info("Write reprt in yaml file")
+            utils.write_yaml_file(
+                file_path=self.data_validation_config.report_file_path,
+                data=self.validation_error,
+            )
+
+            data_validation_artifact = artifact_entity.DataValidationArtifact(
+                report_file_path=self.data_validation_config.report_file_path,
+            )
+            logging.info(f"Data validation artifact: {data_validation_artifact}")
+            return data_validation_artifact
+        except Exception as e:
+            raise SensorException(e, sys)
+
+
+-- sensor\components\model_evaluation.py --
+from sensor.predictor import ModelResolver
+from sensor.entity import config_entity, artifact_entity
+from sensor.exception import SensorException
+from sensor.logger import logging
+from sensor.utils import load_object
+from sklearn.metrics import f1_score
+import pandas as pd
+import sys, os
+from sensor.config import TARGET_COLUMN
+
+
+class ModelEvaluation:
+
+    def __init__(
+        self,
+        model_eval_config: config_entity.ModelEvaluationConfig,
+        data_ingestion_artifact: artifact_entity.DataIngestionArtifact,
+        data_transformation_artifact: artifact_entity.DataTransformationArtifact,
+        model_trainer_artifact: artifact_entity.ModelTrainerArtifact,
+    ):
+        try:
+            logging.info(f"{'>>'*20}  Model Evaluation {'<<'*20}")
+            self.model_eval_config = model_eval_config
+            self.data_ingestion_artifact = data_ingestion_artifact
+            self.data_transformation_artifact = data_transformation_artifact
+            self.model_trainer_artifact = model_trainer_artifact
+            self.model_resolver = ModelResolver()
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def initiate_model_evaluation(self) -> artifact_entity.ModelEvaluationArtifact:
+        try:
+            # if saved model folder has model the we will compare
+            # which model is best trained or the model from saved model folder
+
+            logging.info(
+                "if saved model folder has model the we will compare "
+                "which model is best trained or the model from saved model folder"
+            )
+            latest_dir_path = self.model_resolver.get_latest_dir_path()
+            if latest_dir_path == None:
+                model_eval_artifact = artifact_entity.ModelEvaluationArtifact(
+                    is_model_accepted=True, improved_accuracy=None
+                )
+                logging.info(f"Model evaluation artifact: {model_eval_artifact}")
+                return model_eval_artifact
+
+            # Finding location of transformer model and target encoder
+            logging.info("Finding location of transformer model and target encoder")
+            transformer_path = self.model_resolver.get_latest_transformer_path()
+            model_path = self.model_resolver.get_latest_model_path()
+            target_encoder_path = self.model_resolver.get_latest_target_encoder_path()
+
+            logging.info(
+                "Previous trained objects of transformer, model and target encoder"
+            )
+            # Previous trained  objects
+            transformer = load_object(file_path=transformer_path)
+            model = load_object(file_path=model_path)
+            target_encoder = load_object(file_path=target_encoder_path)
+
+            logging.info("Currently trained model objects")
+            # Currently trained model objects
+            current_transformer = load_object(
+                file_path=self.data_transformation_artifact.transform_object_path
+            )
+            current_model = load_object(
+                file_path=self.model_trainer_artifact.model_path
+            )
+            current_target_encoder = load_object(
+                file_path=self.data_transformation_artifact.target_encoder_path
+            )
+
+            test_df = pd.read_csv(self.data_ingestion_artifact.test_file_path)
+            target_df = test_df[TARGET_COLUMN]
+            y_true = target_encoder.transform(target_df)
+            # accuracy using previous trained model
+
+            input_feature_name = list(transformer.feature_names_in_)
+            input_arr = transformer.transform(test_df[input_feature_name])
+            y_pred = model.predict(input_arr)
+            print(
+                f"Prediction using previous model: {target_encoder.inverse_transform(y_pred[:5])}"
+            )
+            previous_model_score = f1_score(y_true=y_true, y_pred=y_pred)
+            logging.info(
+                f"Accuracy using previous trained model: {previous_model_score}"
+            )
+
+            # accuracy using current trained model
+            input_feature_name = list(current_transformer.feature_names_in_)
+            input_arr = current_transformer.transform(test_df[input_feature_name])
+            y_pred = current_model.predict(input_arr)
+            y_true = current_target_encoder.transform(target_df)
+            print(
+                f"Prediction using trained model: {current_target_encoder.inverse_transform(y_pred[:5])}"
+            )
+            current_model_score = f1_score(y_true=y_true, y_pred=y_pred)
+            logging.info(f"Accuracy using current trained model: {current_model_score}")
+            if current_model_score <= previous_model_score:
+                logging.info(f"Current trained model is not better than previous model")
+                raise Exception(
+                    "Current trained model is not better than previous model"
+                )
+
+            model_eval_artifact = artifact_entity.ModelEvaluationArtifact(
+                is_model_accepted=True,
+                improved_accuracy=current_model_score - previous_model_score,
+            )
+            logging.info(f"Model eval artifact: {model_eval_artifact}")
+            return model_eval_artifact
+        except Exception as e:
+            raise SensorException(e, sys)
+
+
+-- sensor\components\model_pusher.py --
+from sensor.predictor import ModelResolver
+from sensor.entity.config_entity import ModelPusherConfig
+from sensor.exception import SensorException
+import os, sys
+from sensor.utils import load_object, save_object
+from sensor.logger import logging
+from sensor.entity.artifact_entity import (
+    DataTransformationArtifact,
+    ModelTrainerArtifact,
+    ModelPusherArtifact,
+)
+
+
+class ModelPusher:
+
+    def __init__(
+        self,
+        model_pusher_config: ModelPusherConfig,
+        data_transformation_artifact: DataTransformationArtifact,
+        model_trainer_artifact: ModelTrainerArtifact,
+    ):
+        try:
+            logging.info(f"{'>>'*20} Data Transformation {'<<'*20}")
+            self.model_pusher_config = model_pusher_config
+            self.data_transformation_artifact = data_transformation_artifact
+            self.model_trainer_artifact = model_trainer_artifact
+            self.model_resolver = ModelResolver(
+                model_registry=self.model_pusher_config.saved_model_dir
+            )
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def initiate_model_pusher(
+        self,
+    ) -> ModelPusherArtifact:
+        try:
+            # load object
+            logging.info(f"Loading transformer model and target encoder")
+            transformer = load_object(
+                file_path=self.data_transformation_artifact.transform_object_path
+            )
+            model = load_object(file_path=self.model_trainer_artifact.model_path)
+            target_encoder = load_object(
+                file_path=self.data_transformation_artifact.target_encoder_path
+            )
+
+            # model pusher dir
+            logging.info(f"Saving model into model pusher directory")
+            save_object(
+                file_path=self.model_pusher_config.pusher_transformer_path,
+                obj=transformer,
+            )
+            save_object(file_path=self.model_pusher_config.pusher_model_path, obj=model)
+            save_object(
+                file_path=self.model_pusher_config.pusher_target_encoder_path,
+                obj=target_encoder,
+            )
+
+            # saved model dir
+            logging.info(f"Saving model in saved model dir")
+            transformer_path = self.model_resolver.get_latest_save_transformer_path()
+            model_path = self.model_resolver.get_latest_save_model_path()
+            target_encoder_path = (
+                self.model_resolver.get_latest_save_target_encoder_path()
+            )
+
+            save_object(file_path=transformer_path, obj=transformer)
+            save_object(file_path=model_path, obj=model)
+            save_object(file_path=target_encoder_path, obj=target_encoder)
+
+            model_pusher_artifact = ModelPusherArtifact(
+                pusher_model_dir=self.model_pusher_config.pusher_model_dir,
+                saved_model_dir=self.model_pusher_config.saved_model_dir,
+            )
+            logging.info(f"Model pusher artifact: {model_pusher_artifact}")
+            return model_pusher_artifact
+        except Exception as e:
+            raise SensorException(e, sys)
+
+
+-- sensor\components\model_trainer.py --
+from sensor.entity import artifact_entity, config_entity
+from sensor.exception import SensorException
+from sensor.logger import logging
+from typing import Optional
+import os, sys
+from xgboost import XGBClassifier
+from sensor import utils
+from sklearn.metrics import f1_score
+
+
+class ModelTrainer:
+
+    def __init__(
+        self,
+        model_trainer_config: config_entity.ModelTrainerConfig,
+        data_transformation_artifact: artifact_entity.DataTransformationArtifact,
+    ):
+        try:
+            logging.info(f"{'>>'*20} Model Trainer {'<<'*20}")
+            self.model_trainer_config = model_trainer_config
+            self.data_transformation_artifact = data_transformation_artifact
+
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def fine_tune(self):
+        try:
+            # Wite code for Grid Search CV
+            pass
+
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def train_model(self, x, y):
+        try:
+            xgb_clf = XGBClassifier()
+            xgb_clf.fit(x, y)
+            return xgb_clf
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def initiate_model_trainer(
+        self,
+    ) -> artifact_entity.ModelTrainerArtifact:
+        try:
+            logging.info(f"Loading train and test array.")
+            train_arr = utils.load_numpy_array_data(
+                file_path=self.data_transformation_artifact.transformed_train_path
+            )
+            test_arr = utils.load_numpy_array_data(
+                file_path=self.data_transformation_artifact.transformed_test_path
+            )
+
+            logging.info(
+                f"Splitting input and target feature from both train and test arr."
+            )
+            x_train, y_train = train_arr[:, :-1], train_arr[:, -1]
+            x_test, y_test = test_arr[:, :-1], test_arr[:, -1]
+
+            logging.info(f"Train the model")
+            model = self.train_model(x=x_train, y=y_train)
+
+            logging.info(f"Calculating f1 train score")
+            yhat_train = model.predict(x_train)
+            f1_train_score = f1_score(y_true=y_train, y_pred=yhat_train)
+
+            logging.info(f"Calculating f1 test score")
+            yhat_test = model.predict(x_test)
+            f1_test_score = f1_score(y_true=y_test, y_pred=yhat_test)
+
+            logging.info(
+                f"train score:{f1_train_score} and tests score {f1_test_score}"
+            )
+            # check for overfitting or underfiiting or expected score
+            logging.info(f"Checking if our model is underfitting or not")
+            if f1_test_score < self.model_trainer_config.expected_score:
+                raise Exception(
+                    f"Model is not good as it is not able to give \
+                expected accuracy: {self.model_trainer_config.expected_score}: model actual score: {f1_test_score}"
+                )
+
+            logging.info(f"Checking if our model is overfiiting or not")
+            diff = abs(f1_train_score - f1_test_score)
+
+            if diff > self.model_trainer_config.overfitting_threshold:
+                raise Exception(
+                    f"Train and test score diff: {diff} is more than overfitting threshold {self.model_trainer_config.overfitting_threshold}"
+                )
+
+            # save the trained model
+            logging.info(f"Saving mode object")
+            utils.save_object(file_path=self.model_trainer_config.model_path, obj=model)
+
+            # prepare artifact
+            logging.info(f"Prepare the artifact")
+            model_trainer_artifact = artifact_entity.ModelTrainerArtifact(
+                model_path=self.model_trainer_config.model_path,
+                f1_train_score=f1_train_score,
+                f1_test_score=f1_test_score,
+            )
+            logging.info(f"Model trainer artifact: {model_trainer_artifact}")
+            return model_trainer_artifact
+        except Exception as e:
+            raise SensorException(e, sys)
+
+
+-- sensor\components\__init__.py --
+
+
+-- sensor\entity\artifact_entity.py --
+from dataclasses import dataclass
+
+
+@dataclass
+class DataIngestionArtifact:
+    feature_store_file_path: str
+    train_file_path: str
+    test_file_path: str
+
+
+@dataclass
+class DataValidationArtifact:
+    report_file_path: str
+
+
+@dataclass
+class DataTransformationArtifact:
+    transform_object_path: str
+    transformed_train_path: str
+    transformed_test_path: str
+    target_encoder_path: str
+
+
+@dataclass
+class ModelTrainerArtifact:
+    model_path: str
+    f1_train_score: float
+    f1_test_score: float
+
+
+@dataclass
+class ModelEvaluationArtifact:
+    is_model_accepted: bool
+    improved_accuracy: float
+
+
+@dataclass
+class ModelPusherArtifact:
+    pusher_model_dir: str
+    saved_model_dir: str
+
+
+-- sensor\entity\config_entity.py --
+import os, sys
+from datetime import datetime
+from sensor.exception import SensorException
+from sensor.logger import logging
+
+FILE_NAME = "sensor.csv"
+TRAIN_FILE_NAME = "train.csv"
+TEST_FILE_NAME = "test.csv"
+TRANSFORMER_OBJECT_FILE_NAME = "transformer.pkl"
+TARGET_ENCODER_OBJECT_FILE_NAME = "target_encoder.pkl"
+MODEL_FILE_NAME = "model.pkl"
+
+
+class TrainingPipelineConfig:
+
+    def __init__(self):
+        try:
+            self.artifact_dir = os.path.join(
+                os.getcwd(), "artifact", f"{datetime.now().strftime('%m%d%Y__%H%M%S')}"
+            )
+        except Exception as e:
+            raise SensorException(e, sys)
+
+
+class DataIngestionConfig:
+
+    def __init__(self, training_pipeline_config: TrainingPipelineConfig):
+        try:
+            self.database_name = "aps"
+            self.collection_name = "sensor"
+            self.data_ingestion_dir = os.path.join(
+                training_pipeline_config.artifact_dir, "data_ingestion"
+            )
+            self.feature_store_file_path = os.path.join(
+                self.data_ingestion_dir, "feature_store", FILE_NAME
+            )
+            self.train_file_path = os.path.join(
+                self.data_ingestion_dir, "dataset", TRAIN_FILE_NAME
+            )
+            self.test_file_path = os.path.join(
+                self.data_ingestion_dir, "dataset", TEST_FILE_NAME
+            )
+            self.test_size = 0.2
+        except Exception as e:
+            raise SensorException(e, sys)
+
+    def to_dict(
+        self,
+    ) -> dict:
+        try:
+            return self.__dict__
+        except Exception as e:
+            raise SensorException(e, sys)
+
+
+class DataValidationConfig:
+    def __init__(self, training_pipeline_config: TrainingPipelineConfig):
+        self.data_validation_dir = os.path.join(
+            training_pipeline_config.artifact_dir, "data_validation"
+        )
+        self.report_file_path = os.path.join(self.data_validation_dir, "report.yaml")
+        self.missing_threshold: float = 0.2
+        self.base_file_path = os.path.join("aps_failure_training_set1.csv")
+
+
+class DataTransformationConfig:
+
+    def __init__(self, training_pipeline_config: TrainingPipelineConfig):
+        self.data_transformation_dir = os.path.join(
+            training_pipeline_config.artifact_dir, "data_transformation"
+        )
+        self.transform_object_path = os.path.join(
+            self.data_transformation_dir, "transformer", TRANSFORMER_OBJECT_FILE_NAME
+        )
+        self.transformed_train_path = os.path.join(
+            self.data_transformation_dir,
+            "transformed",
+            TRAIN_FILE_NAME.replace("csv", "npz"),
+        )
+        self.transformed_test_path = os.path.join(
+            self.data_transformation_dir,
+            "transformed",
+            TEST_FILE_NAME.replace("csv", "npz"),
+        )
+        self.target_encoder_path = os.path.join(
+            self.data_transformation_dir,
+            "target_encoder",
+            TARGET_ENCODER_OBJECT_FILE_NAME,
+        )
+
+
+class ModelTrainerConfig:
+
+    def __init__(self, training_pipeline_config: TrainingPipelineConfig):
+        self.model_trainer_dir = os.path.join(
+            training_pipeline_config.artifact_dir, "model_trainer"
+        )
+        self.model_path = os.path.join(self.model_trainer_dir, "model", MODEL_FILE_NAME)
+        self.expected_score = 0.7
+        self.overfitting_threshold = 0.1
+
+
+class ModelEvaluationConfig:
+    def __init__(self, training_pipeline_config: TrainingPipelineConfig):
+        self.change_threshold = 0.01
+
+
+class ModelPusherConfig:
+
+    def __init__(self, training_pipeline_config: TrainingPipelineConfig):
+        self.model_pusher_dir = os.path.join(
+            training_pipeline_config.artifact_dir, "model_pusher"
+        )
+        self.saved_model_dir = os.path.join("saved_models")
+        self.pusher_model_dir = os.path.join(self.model_pusher_dir, "saved_models")
+        self.pusher_model_path = os.path.join(self.pusher_model_dir, MODEL_FILE_NAME)
+        self.pusher_transformer_path = os.path.join(
+            self.pusher_model_dir, TRANSFORMER_OBJECT_FILE_NAME
+        )
+        self.pusher_target_encoder_path = os.path.join(
+            self.pusher_model_dir, TARGET_ENCODER_OBJECT_FILE_NAME
+        )
+
+
+-- sensor\entity\__init__.py --
+
+
+-- sensor\pipeline\training_pipeline.py --
+
+
+-- sensor\pipeline\__init__.py --
+
+
